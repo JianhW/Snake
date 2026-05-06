@@ -1,3 +1,4 @@
+// snake第二版，五档速度调节
 module VGA_test
 (
   input clk,
