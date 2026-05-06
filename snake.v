@@ -1,3 +1,4 @@
+//snake初版
 module VGA_test
 (
   input clk,
