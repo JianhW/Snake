@@ -1,0 +1,107 @@
+module apb_framebuffer
+(
+    input              PCLK,
+    input              PRESETn,
+
+    input      [31:0]  PADDR,
+    input              PENABLE,
+    input              PSEL,
+    input              PWRITE,
+    input      [31:0]  PWDATA,
+
+    output reg [31:0]  PRDATA,
+    output             PREADY,
+    output             PSLVERROR,
+
+    // VGA read side
+    input      [11:0]  pixel_addr,
+    output     [15:0]  pixel_data
+);
+
+/////////////////////////////////////////////////////
+// framebuffer control
+/////////////////////////////////////////////////////
+
+reg         we_a;
+wire [11:0] addr_a;
+reg [15:0]  wdata_a;
+wire [15:0] rdata_a;
+
+/////////////////////////////////////////////////////
+// APB decode
+/////////////////////////////////////////////////////
+
+wire apb_write;
+wire apb_read;
+
+assign apb_write = PSEL && PENABLE && PWRITE;
+assign apb_read  = PSEL && PENABLE && !PWRITE;
+
+/////////////////////////////////////////////////////
+// framebuffer base address
+/////////////////////////////////////////////////////
+
+parameter FB_BASE = 32'hF8100000;
+
+assign addr_a = (PADDR - FB_BASE) >> 1;
+
+/////////////////////////////////////////////////////
+// write logic
+/////////////////////////////////////////////////////
+
+always @(posedge PCLK or negedge PRESETn)
+begin
+    if(!PRESETn)
+    begin
+        we_a    <= 1'b0;
+        wdata_a <= 16'd0;
+    end
+    else
+    begin
+        we_a <= apb_write;
+
+        if(apb_write)
+            wdata_a <= PWDATA[15:0];
+    end
+end
+
+/////////////////////////////////////////////////////
+// read logic
+/////////////////////////////////////////////////////
+
+always @(posedge PCLK)
+begin
+    if(apb_read)
+        PRDATA <= {16'd0, rdata_a};
+end
+
+/////////////////////////////////////////////////////
+// APB response
+/////////////////////////////////////////////////////
+
+assign PREADY    = 1'b1;
+assign PSLVERROR = 1'b0;
+
+/////////////////////////////////////////////////////
+// framebuffer IP
+/////////////////////////////////////////////////////
+
+framebuffer u_framebuffer
+(
+    // CPU/APB side
+    .we_a    (we_a),
+    .addr_a  (addr_a),
+    .wdata_a (wdata_a),
+    .rdata_a (rdata_a),
+
+    // VGA side
+    .we_b    (1'b0),
+    .addr_b  (pixel_addr),
+    .wdata_b (16'd0),
+    .rdata_b (pixel_data),
+
+    .clk     (PCLK),
+    .clke    (1'b1)
+);
+
+endmodule
