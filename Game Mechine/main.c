@@ -12,6 +12,8 @@
 
 #define GPIO_BASE SYSTEM_GPIO_0_IO_CTRL
 #define SWITCH_REG_ADDR (FB_BASE + 8192u)
+#define SEG_TIME_REG_ADDR  (FB_BASE + 8196u)
+#define SEG_SCORE_REG_ADDR (FB_BASE + 8200u)
 
 #define BUTTON_UP_MASK    (1u << 0)
 #define BUTTON_DOWN_MASK  (1u << 1)
@@ -27,6 +29,7 @@
 
 #define BUZZER_MASK (1u << 3)
 #define INPUT_ACTIVE_HIGH 1
+#define BUZZER_TONE_HZ 1200u
 
 #define COLOR_BLACK   0x0000
 #define COLOR_WHITE   0xFFFF
@@ -39,17 +42,35 @@
 #define COLOR_CYAN    0x07FF
 #define COLOR_BLUE    0x041F
 #define COLOR_PINK    0xF81F
+#define COLOR_PURPLE  0xA11F
 #define COLOR_SILVER  0xC638
 #define COLOR_SHADOW  0x18C3
 #define COLOR_SKY     0x869F
 
 #define MAX_SNAKE_LENGTH 160
 
-#define TETRIS_W 10
-#define TETRIS_H 14
+#define TETRIS_W 9
+#define TETRIS_H 16
 #define TETRIS_X0 2
-#define TETRIS_Y0 8
+#define TETRIS_Y0 5
 #define TETRIS_CELL 3
+#define TETRIS_FRAME_PAD_X 1
+#define TETRIS_FRAME_PAD_TOP 4
+#define TETRIS_FRAME_PAD_BOTTOM 1
+#define TETRIS_INFO_DIV_X 36
+#define TETRIS_PREVIEW_LABEL_X 40
+#define TETRIS_PREVIEW_LABEL_Y 8
+#define TETRIS_PREVIEW_BOX_X 44
+#define TETRIS_PREVIEW_BOX_Y 20
+#define TETRIS_PREVIEW_CELL 3
+#define TETRIS_PREVIEW_BOX_W (TETRIS_PREVIEW_CELL * 4 + 2)
+#define TETRIS_PREVIEW_BOX_H (TETRIS_PREVIEW_CELL * 4 + 2)
+#define TETRIS_SCORE_LABEL_X 40
+#define TETRIS_SCORE_LABEL_Y 42
+#define TETRIS_SCORE_VALUE_X 40
+#define TETRIS_SCORE_VALUE_Y 50
+#define TETRIS_SCORE_VALUE_W 21
+#define TETRIS_SCORE_VALUE_H 7
 
 typedef enum
 {
@@ -86,6 +107,8 @@ typedef struct
 
 static volatile uint16_t *const fb = (volatile uint16_t *)FB_BASE;
 static volatile uint32_t *const switch_reg = (volatile uint32_t *)SWITCH_REG_ADDR;
+static volatile uint32_t *const seg_time_reg = (volatile uint32_t *)SEG_TIME_REG_ADDR;
+static volatile uint32_t *const seg_score_reg = (volatile uint32_t *)SEG_SCORE_REG_ADDR;
 
 static app_state_t app_state;
 static substate_t snake_state;
@@ -98,7 +121,9 @@ static uint32_t switch_state;
 static uint32_t prev_switch_state;
 static uint32_t move_delay_loops;
 static uint32_t tetris_delay_loops;
-static uint32_t buzzer_ticks;
+static uint64_t buzzer_end_ticks;
+static uint64_t buzzer_next_toggle_ticks;
+static uint32_t buzzer_state;
 
 static point_t snake[MAX_SNAKE_LENGTH];
 static int snake_length;
@@ -121,10 +146,23 @@ static uint32_t tetris_drop_counter;
 static uint32_t tetris_prev_score;
 static int tetris_prev_next_piece;
 static int tetris_ui_dirty;
+static uint64_t snake_timer_start_ticks;
+static uint64_t tetris_timer_start_ticks;
+static uint32_t snake_timer_frozen_seconds;
+static uint32_t tetris_timer_frozen_seconds;
+static uint32_t snake_timer_running;
+static uint32_t tetris_timer_running;
 
 static uint16_t tetris_color(uint8_t value);
+static uint16_t tetris_panel_color(void);
+static uint16_t tetris_panel_border_color(void);
+static uint16_t tetris_line_primary_color(void);
+static uint16_t tetris_line_secondary_color(void);
+static uint16_t tetris_text_color(void);
+static uint16_t tetris_value_color(void);
 static int tetris_cell_filled(int piece, int rot, int py, int px);
 static void tetris_draw_preview(void);
+static void tetris_draw_score_panel(void);
 
 static const uint8_t glyph_space[7] = {0, 0, 0, 0, 0, 0, 0};
 static const uint8_t glyph_a[7] = {14, 17, 17, 31, 17, 17, 17};
@@ -143,6 +181,7 @@ static const uint8_t glyph_s[7] = {15, 16, 16, 14, 1, 1, 30};
 static const uint8_t glyph_t[7] = {31, 4, 4, 4, 4, 4, 4};
 static const uint8_t glyph_u[7] = {17, 17, 17, 17, 17, 17, 14};
 static const uint8_t glyph_v[7] = {17, 17, 17, 17, 17, 10, 4};
+static const uint8_t glyph_x[7] = {17, 17, 10, 4, 10, 17, 17};
 static const uint8_t glyph_y[7] = {17, 17, 10, 4, 4, 4, 4};
 
 static const uint8_t digit_0[7] = {14, 17, 19, 21, 25, 17, 14};
@@ -282,27 +321,175 @@ static void buzzer_on(void)
 {
     gpio_setOutputEnable(GPIO_BASE, BUZZER_MASK);
     gpio_setOutput(GPIO_BASE, BUZZER_MASK);
+    buzzer_state = 1u;
 }
 
 static void buzzer_off(void)
 {
     gpio_setOutputEnable(GPIO_BASE, BUZZER_MASK);
     gpio_setOutput(GPIO_BASE, 0u);
+    buzzer_end_ticks = 0u;
+    buzzer_next_toggle_ticks = 0u;
+    buzzer_state = 0u;
+}
+
+static uint64_t buzzer_half_period_ticks(void)
+{
+    uint64_t half_period = (uint64_t)BSP_MACHINE_TIMER_HZ / ((uint64_t)BUZZER_TONE_HZ * 2u);
+
+    if(half_period == 0u)
+        half_period = 1u;
+
+    return half_period;
+}
+
+static uint64_t timer_now(void)
+{
+    return machineTimer_getTime(BSP_MACHINE_TIMER);
+}
+
+static uint16_t pack_bcd4(uint32_t value)
+{
+    if(value > 9999u)
+        value = 9999u;
+
+    return (uint16_t)(
+        ((value / 1000u) % 10u) << 12 |
+        ((value / 100u)  % 10u) << 8  |
+        ((value / 10u)   % 10u) << 4  |
+        (value % 10u)
+    );
+}
+
+static void sevenseg_show(uint32_t time_value, uint32_t score_value)
+{
+    *seg_time_reg = (uint32_t)pack_bcd4(time_value);
+    *seg_score_reg = (uint32_t)pack_bcd4(score_value);
+}
+
+static void sevenseg_clear(void)
+{
+    sevenseg_show(0u, 0u);
+}
+
+static uint32_t timer_seconds_from_start(uint64_t start_ticks)
+{
+    return (uint32_t)((timer_now() - start_ticks) / (uint64_t)BSP_MACHINE_TIMER_HZ);
+}
+
+static uint32_t snake_timer_seconds(void)
+{
+    if(snake_timer_running)
+        return timer_seconds_from_start(snake_timer_start_ticks);
+
+    return snake_timer_frozen_seconds;
+}
+
+static uint32_t tetris_timer_seconds(void)
+{
+    if(tetris_timer_running)
+        return timer_seconds_from_start(tetris_timer_start_ticks);
+
+    return tetris_timer_frozen_seconds;
+}
+
+static void snake_timer_begin(void)
+{
+    snake_timer_start_ticks = timer_now();
+    snake_timer_frozen_seconds = 0u;
+    snake_timer_running = 1u;
+}
+
+static void snake_timer_pause(void)
+{
+    if(snake_timer_running)
+    {
+        snake_timer_frozen_seconds = snake_timer_seconds();
+        snake_timer_running = 0u;
+    }
+}
+
+static void snake_timer_resume(void)
+{
+    if(!snake_timer_running)
+    {
+        snake_timer_start_ticks = timer_now() - ((uint64_t)snake_timer_frozen_seconds * (uint64_t)BSP_MACHINE_TIMER_HZ);
+        snake_timer_running = 1u;
+    }
+}
+
+static void snake_timer_stop(void)
+{
+    snake_timer_frozen_seconds = snake_timer_seconds();
+    snake_timer_running = 0u;
+}
+
+static void tetris_timer_begin(void)
+{
+    tetris_timer_start_ticks = timer_now();
+    tetris_timer_frozen_seconds = 0u;
+    tetris_timer_running = 1u;
+}
+
+static void tetris_timer_pause(void)
+{
+    if(tetris_timer_running)
+    {
+        tetris_timer_frozen_seconds = tetris_timer_seconds();
+        tetris_timer_running = 0u;
+    }
+}
+
+static void tetris_timer_resume(void)
+{
+    if(!tetris_timer_running)
+    {
+        tetris_timer_start_ticks = timer_now() - ((uint64_t)tetris_timer_frozen_seconds * (uint64_t)BSP_MACHINE_TIMER_HZ);
+        tetris_timer_running = 1u;
+    }
+}
+
+static void tetris_timer_stop(void)
+{
+    tetris_timer_frozen_seconds = tetris_timer_seconds();
+    tetris_timer_running = 0u;
 }
 
 static void trigger_buzzer(uint32_t ticks)
 {
-    buzzer_ticks = ticks;
+    uint64_t now = timer_now();
+    uint64_t duration_ticks = ((uint64_t)ticks * (uint64_t)BSP_MACHINE_TIMER_HZ) / 1000u;
+    uint64_t half_period = buzzer_half_period_ticks();
+
+    if(duration_ticks < half_period * 8u)
+        duration_ticks = half_period * 8u;
+
+    buzzer_end_ticks = now + duration_ticks;
+    buzzer_next_toggle_ticks = now + half_period;
     buzzer_on();
 }
 
 static void service_buzzer(void)
 {
-    if(buzzer_ticks > 0u)
+    if(buzzer_end_ticks != 0u)
     {
-        buzzer_ticks--;
-        if(buzzer_ticks == 0u)
+        uint64_t now = timer_now();
+        uint64_t half_period = buzzer_half_period_ticks();
+
+        if(now >= buzzer_end_ticks)
+        {
+            buzzer_end_ticks = 0u;
+            buzzer_next_toggle_ticks = 0u;
             buzzer_off();
+            return;
+        }
+
+        while(now >= buzzer_next_toggle_ticks)
+        {
+            buzzer_state ^= 1u;
+            gpio_setOutput(GPIO_BASE, buzzer_state ? BUZZER_MASK : 0u);
+            buzzer_next_toggle_ticks += half_period;
+        }
     }
 }
 
@@ -320,6 +507,11 @@ static uint16_t border_primary_color(void)
 static uint16_t border_secondary_color(void)
 {
     return (switch_state & SWITCH_THEME_MASK) ? COLOR_BLUE : COLOR_ORANGE;
+}
+
+static uint16_t menu_title_color(void)
+{
+    return (switch_state & SWITCH_THEME_MASK) ? COLOR_WHITE : COLOR_SILVER;
 }
 
 static uint16_t snake_head_color(void)
@@ -381,6 +573,7 @@ static const uint8_t *get_glyph(char c)
         case 'T': return glyph_t;
         case 'U': return glyph_u;
         case 'V': return glyph_v;
+        case 'X': return glyph_x;
         case 'Y': return glyph_y;
         case '0': return digit_0;
         case '1': return digit_1;
@@ -589,19 +782,19 @@ static void update_mode_from_switches(void)
     switch(speed_sel)
     {
         case 0u:
-            move_delay_loops = 240000u;
+            move_delay_loops = 360000u;
             tetris_delay_loops = 260000u;
             break;
         case SWITCH_SPEED0_MASK:
-            move_delay_loops = 180000u;
+            move_delay_loops = 280000u;
             tetris_delay_loops = 210000u;
             break;
         case SWITCH_SPEED1_MASK:
-            move_delay_loops = 130000u;
+            move_delay_loops = 220000u;
             tetris_delay_loops = 160000u;
             break;
         default:
-            move_delay_loops = 90000u;
+            move_delay_loops = 160000u;
             tetris_delay_loops = 110000u;
             break;
     }
@@ -631,8 +824,9 @@ static void draw_score_box(uint32_t value, char label)
 static void show_menu(void)
 {
     clear_screen(COLOR_BLACK);
-    draw_center_text(6, "GAME", border_primary_color(), 1);
-    draw_center_text(16, "MENU", border_secondary_color(), 1);
+    draw_center_text(6, "GAME", menu_title_color(), 1);
+    draw_center_text(16, "MENU", menu_title_color(), 1);
+    sevenseg_clear();
 
     if(menu_item == MENU_SNAKE)
         fill_rect(10, 28, 3, 6, score_accent_color());
@@ -674,6 +868,7 @@ static void snake_render(void)
         snake_draw_segment(snake[i], i == 0);
 
     draw_score_box(snake_score, 'S');
+    sevenseg_show(snake_timer_seconds(), snake_score);
 }
 
 static int snake_on_body(int x, int y)
@@ -728,6 +923,7 @@ static void snake_start(direction_t dir)
 {
     snake_reset(dir);
     snake_spawn_food();
+    snake_timer_begin();
     snake_state = SUBSTATE_PLAYING;
     buzzer_off();
     snake_render();
@@ -767,6 +963,7 @@ static void show_snake_ready(void)
     draw_center_text(30, "PRESS", COLOR_WHITE, 1);
     draw_center_text(38, "ANY", score_accent_color(), 1);
     draw_center_text(46, "KEY", score_accent_color(), 1);
+    sevenseg_clear();
 }
 
 static void show_snake_over(void)
@@ -794,6 +991,8 @@ static void snake_finish(void)
     if(snake_score > snake_best_score)
         snake_best_score = snake_score;
 
+    snake_timer_stop();
+    sevenseg_show(snake_timer_seconds(), snake_score);
     snake_state = SUBSTATE_OVER;
     show_snake_over();
 }
@@ -860,16 +1059,101 @@ static void snake_step(void)
 
     snake_draw_segment(old_head, 0);
     snake_draw_segment(new_head, 1);
+    sevenseg_show(snake_timer_seconds(), snake_score);
 }
 
 static void draw_tetris_cell(int x, int y, uint16_t color)
 {
-    fill_rect(TETRIS_X0 + x * TETRIS_CELL, TETRIS_Y0 + y * TETRIS_CELL, TETRIS_CELL, TETRIS_CELL, color);
+    uint16_t fill = color;
+
+    if(fill == COLOR_BLACK)
+        fill = COLOR_BLACK;
+
+    fill_rect(TETRIS_X0 + x * TETRIS_CELL, TETRIS_Y0 + y * TETRIS_CELL, TETRIS_CELL, TETRIS_CELL, fill);
+    if(color != COLOR_BLACK)
+        draw_pixel(TETRIS_X0 + x * TETRIS_CELL, TETRIS_Y0 + y * TETRIS_CELL, mix565(fill, COLOR_WHITE));
+}
+
+static uint16_t tetris_panel_color(void)
+{
+    return COLOR_BLACK;
+}
+
+static uint16_t tetris_panel_border_color(void)
+{
+    return tetris_line_primary_color();
+}
+
+static uint16_t tetris_panel_band_color(void)
+{
+    return COLOR_BLACK;
+}
+
+static uint16_t tetris_line_primary_color(void)
+{
+    return COLOR_CYAN;
+}
+
+static uint16_t tetris_line_secondary_color(void)
+{
+    return COLOR_PURPLE;
+}
+
+static uint16_t tetris_text_color(void)
+{
+    return COLOR_CYAN;
+}
+
+static uint16_t tetris_value_color(void)
+{
+    return COLOR_PURPLE;
+}
+
+static uint16_t tetris_preview_label_color(void)
+{
+    return tetris_text_color();
+}
+
+static uint16_t tetris_line_color_at(int x, int y)
+{
+    return (((x + y) & 1) == 0) ? tetris_line_primary_color() : tetris_line_secondary_color();
+}
+
+static void tetris_draw_pattern_hline(int x, int y, int w)
+{
+    int i;
+
+    for(i = 0; i < w; i++)
+        draw_pixel(x + i, y, tetris_line_color_at(x + i, y));
+}
+
+static void tetris_draw_pattern_vline(int x, int y, int h)
+{
+    int i;
+
+    for(i = 0; i < h; i++)
+        draw_pixel(x, y + i, tetris_line_color_at(x, y + i));
+}
+
+static void tetris_draw_frame_box(int x, int y, int w, int h, uint16_t fill)
+{
+    fill_rect(x, y, w, h, fill);
+    tetris_draw_pattern_hline(x, y, w);
+    tetris_draw_pattern_hline(x, y + h - 1, w);
+    tetris_draw_pattern_vline(x, y, h);
+    tetris_draw_pattern_vline(x + w - 1, y, h);
 }
 
 static void tetris_clear_dynamic_area(void)
 {
-    fill_rect(TETRIS_X0, TETRIS_Y0, TETRIS_W * TETRIS_CELL, TETRIS_H * TETRIS_CELL, COLOR_BLACK);
+    int x;
+    int y;
+
+    for(y = 0; y < TETRIS_H; y++)
+    {
+        for(x = 0; x < TETRIS_W; x++)
+            draw_tetris_cell(x, y, COLOR_BLACK);
+    }
 }
 
 static void tetris_compose_cells(uint8_t out[TETRIS_H][TETRIS_W])
@@ -944,7 +1228,19 @@ static uint16_t tetris_color(uint8_t value)
 static void tetris_draw_board(void)
 {
     fill_rect(0, 0, FB_WIDTH, FB_HEIGHT, COLOR_BLACK);
-    draw_rect_outline(TETRIS_X0 - 1, TETRIS_Y0 - 1, TETRIS_W * TETRIS_CELL + 2, TETRIS_H * TETRIS_CELL + 2, border_primary_color());
+
+    fill_rect(TETRIS_INFO_DIV_X + 1, 0, FB_WIDTH - (TETRIS_INFO_DIV_X + 1), 32, tetris_panel_color());
+    fill_rect(TETRIS_INFO_DIV_X + 1, 32, FB_WIDTH - (TETRIS_INFO_DIV_X + 1), FB_HEIGHT - 32, tetris_panel_band_color());
+    tetris_draw_pattern_vline(TETRIS_INFO_DIV_X, 0, FB_HEIGHT);
+    tetris_draw_pattern_hline(TETRIS_INFO_DIV_X + 1, 38, FB_WIDTH - (TETRIS_INFO_DIV_X + 1));
+
+    tetris_draw_frame_box(
+        TETRIS_X0 - TETRIS_FRAME_PAD_X,
+        TETRIS_Y0 - TETRIS_FRAME_PAD_TOP,
+        TETRIS_W * TETRIS_CELL + (TETRIS_FRAME_PAD_X * 2),
+        TETRIS_H * TETRIS_CELL + TETRIS_FRAME_PAD_TOP + TETRIS_FRAME_PAD_BOTTOM,
+        COLOR_BLACK
+    );
     tetris_clear_dynamic_area();
 }
 
@@ -957,13 +1253,23 @@ static void tetris_draw_preview(void)
 {
     int px;
     int py;
-    int preview_x0 = 48;
-    int preview_y0 = 18;
+    int min_x = 4;
+    int min_y = 4;
+    int max_x = -1;
+    int max_y = -1;
+    int piece_w;
+    int piece_h;
+    int preview_x0;
+    int preview_y0;
 
-    draw_rect_outline(preview_x0 - 2, preview_y0 - 2, 12, 12, border_secondary_color());
-    draw_text(44, 8, "NEXT", score_accent_color(), 1);
-
-    fill_rect(preview_x0, preview_y0, 8, 8, COLOR_BLACK);
+    tetris_draw_frame_box(
+        TETRIS_PREVIEW_BOX_X,
+        TETRIS_PREVIEW_BOX_Y,
+        TETRIS_PREVIEW_BOX_W,
+        TETRIS_PREVIEW_BOX_H,
+        COLOR_BLACK
+    );
+    draw_text(TETRIS_PREVIEW_LABEL_X, TETRIS_PREVIEW_LABEL_Y, "NEXT", tetris_preview_label_color(), 1);
 
     for(py = 0; py < 4; py++)
     {
@@ -971,10 +1277,53 @@ static void tetris_draw_preview(void)
         {
             if(tetris_cell_filled(tetris_next_piece, 0, py, px))
             {
-                fill_rect(preview_x0 + px * 2, preview_y0 + py * 2, 2, 2, tetris_color((uint8_t)(tetris_next_piece + 1)));
+                if(px < min_x) min_x = px;
+                if(py < min_y) min_y = py;
+                if(px > max_x) max_x = px;
+                if(py > max_y) max_y = py;
             }
         }
     }
+
+    if(max_x < min_x || max_y < min_y)
+        return;
+
+    piece_w = (max_x - min_x + 1) * TETRIS_PREVIEW_CELL;
+    piece_h = (max_y - min_y + 1) * TETRIS_PREVIEW_CELL;
+    preview_x0 = TETRIS_PREVIEW_BOX_X + 1 + ((TETRIS_PREVIEW_BOX_W - 2 - piece_w) / 2);
+    preview_y0 = TETRIS_PREVIEW_BOX_Y + 1 + ((TETRIS_PREVIEW_BOX_H - 2 - piece_h) / 2);
+
+    for(py = 0; py < 4; py++)
+    {
+        for(px = 0; px < 4; px++)
+        {
+            if(tetris_cell_filled(tetris_next_piece, 0, py, px))
+            {
+                int cell_x = preview_x0 + (px - min_x) * TETRIS_PREVIEW_CELL;
+                int cell_y = preview_y0 + (py - min_y) * TETRIS_PREVIEW_CELL;
+                uint16_t color = tetris_color((uint8_t)(tetris_next_piece + 1));
+
+                fill_rect(cell_x, cell_y, TETRIS_PREVIEW_CELL, TETRIS_PREVIEW_CELL, color);
+                draw_pixel(cell_x, cell_y, mix565(color, COLOR_WHITE));
+            }
+        }
+    }
+}
+
+static void tetris_draw_score_panel(void)
+{
+    char text[10];
+    int text_x;
+
+    format_u32(tetris_score, text);
+    draw_tiny_text(TETRIS_SCORE_LABEL_X, TETRIS_SCORE_LABEL_Y, "SCORE", tetris_text_color());
+    fill_rect(TETRIS_SCORE_VALUE_X, TETRIS_SCORE_VALUE_Y, TETRIS_SCORE_VALUE_W, TETRIS_SCORE_VALUE_H, COLOR_BLACK);
+
+    text_x = TETRIS_SCORE_VALUE_X + ((TETRIS_SCORE_VALUE_W - text_width(text, 1)) / 2);
+    if(text_x < TETRIS_SCORE_VALUE_X)
+        text_x = TETRIS_SCORE_VALUE_X;
+
+    draw_text(text_x, TETRIS_SCORE_VALUE_Y, text, tetris_value_color(), 1);
 }
 
 static void tetris_draw_piece(int piece, int rot, int base_x, int base_y, uint16_t color)
@@ -1029,7 +1378,7 @@ static void tetris_spawn_piece(void)
     tetris_piece = tetris_next_piece;
     tetris_next_piece = (int)(next_random() % 7u);
     tetris_rot = 0;
-    tetris_x = 3;
+    tetris_x = (TETRIS_W / 2) - 2;
     tetris_y = 0;
     tetris_drop_counter = 0u;
     tetris_ui_dirty = 1u;
@@ -1039,15 +1388,17 @@ static void tetris_spawn_piece(void)
         if(tetris_score > tetris_best_score)
             tetris_best_score = tetris_score;
 
+        tetris_timer_stop();
+        sevenseg_show(tetris_timer_seconds(), tetris_score);
         tetris_state = SUBSTATE_OVER;
         clear_screen(COLOR_BLACK);
-        draw_center_text(16, "GAME", COLOR_RED, 2);
-        draw_center_text(32, "OVER", COLOR_WHITE, 2);
-        draw_center_text(48, "BEST", border_primary_color(), 1);
+        draw_center_text(16, "GAME", tetris_text_color(), 2);
+        draw_center_text(32, "OVER", tetris_value_color(), 2);
+        draw_center_text(48, "BEST", tetris_panel_border_color(), 1);
         {
             char best_text[10];
             format_u32(tetris_best_score, best_text);
-            draw_center_text(56, best_text, COLOR_SKY, 1);
+            draw_center_text(56, best_text, tetris_value_color(), 1);
         }
     }
 }
@@ -1115,7 +1466,7 @@ static void tetris_render(void)
 {
     if(tetris_ui_dirty || tetris_prev_score != tetris_score)
     {
-        draw_score_box(tetris_score, 'T');
+        tetris_draw_score_panel();
         tetris_prev_score = tetris_score;
     }
 
@@ -1127,6 +1478,7 @@ static void tetris_render(void)
 
     tetris_draw_changed_cells();
     tetris_ui_dirty = 0u;
+    sevenseg_show(tetris_timer_seconds(), tetris_score);
 }
 
 static void tetris_reset(void)
@@ -1147,9 +1499,12 @@ static void tetris_reset(void)
     tetris_prev_score = 0xFFFFFFFFu;
     tetris_prev_next_piece = -1;
     tetris_ui_dirty = 1u;
+    tetris_timer_begin();
     tetris_state = SUBSTATE_PLAYING;
     tetris_next_piece = (int)(next_random() % 7u);
     tetris_spawn_piece();
+    if(tetris_state != SUBSTATE_PLAYING)
+        return;
     buzzer_off();
     tetris_draw_board();
     tetris_render();
@@ -1158,18 +1513,19 @@ static void tetris_reset(void)
 static void show_tetris_ready(void)
 {
     clear_screen(COLOR_BLACK);
-    draw_center_text(10, "TETRIS", food_main_color(), 2);
-    draw_center_text(30, "PRESS", COLOR_WHITE, 1);
-    draw_center_text(38, "ANY", score_accent_color(), 1);
-    draw_center_text(46, "KEY", score_accent_color(), 1);
+    draw_center_text(10, "TETRIS", tetris_text_color(), 2);
+    draw_center_text(30, "PRESS", tetris_value_color(), 1);
+    draw_center_text(38, "ANY", tetris_panel_border_color(), 1);
+    draw_center_text(46, "KEY", tetris_panel_border_color(), 1);
+    sevenseg_clear();
 }
 
 static void show_tetris_pause(void)
 {
     clear_screen(COLOR_BLACK);
-    draw_center_text(16, "PAUSE", border_primary_color(), 2);
-    draw_center_text(40, "SW9", COLOR_WHITE, 1);
-    draw_center_text(48, "RUN", score_accent_color(), 1);
+    draw_center_text(16, "PAUSE", tetris_text_color(), 2);
+    draw_center_text(40, "SW9", tetris_value_color(), 1);
+    draw_center_text(48, "RUN", tetris_panel_border_color(), 1);
 }
 
 static void tetris_step(uint16_t pressed)
@@ -1289,7 +1645,9 @@ void main(void)
             {
                 if(switch_state & SWITCH_PAUSE_MASK)
                 {
+                    snake_timer_pause();
                     snake_state = SUBSTATE_PAUSED;
+                    sevenseg_show(snake_timer_seconds(), snake_score);
                     show_snake_pause();
                 }
                 else
@@ -1328,6 +1686,7 @@ void main(void)
             {
                 if((switch_state & SWITCH_PAUSE_MASK) == 0u)
                 {
+                    snake_timer_resume();
                     snake_state = SUBSTATE_PLAYING;
                     snake_render();
                 }
@@ -1344,7 +1703,9 @@ void main(void)
 
             if(switch_state & SWITCH_PAUSE_MASK)
             {
+                snake_timer_pause();
                 snake_state = SUBSTATE_PAUSED;
+                sevenseg_show(snake_timer_seconds(), snake_score);
                 show_snake_pause();
                 game_delay(90000u);
                 continue;
@@ -1362,7 +1723,9 @@ void main(void)
             {
                 if(switch_state & SWITCH_PAUSE_MASK)
                 {
+                    tetris_timer_pause();
                     tetris_state = SUBSTATE_PAUSED;
+                    sevenseg_show(tetris_timer_seconds(), tetris_score);
                     show_tetris_pause();
                 }
                 else
@@ -1402,6 +1765,7 @@ void main(void)
             {
                 if((switch_state & SWITCH_PAUSE_MASK) == 0u)
                 {
+                    tetris_timer_resume();
                     tetris_state = SUBSTATE_PLAYING;
                     tetris_ui_dirty = 1u;
                     tetris_draw_board();
@@ -1420,7 +1784,9 @@ void main(void)
 
             if(switch_state & SWITCH_PAUSE_MASK)
             {
+                tetris_timer_pause();
                 tetris_state = SUBSTATE_PAUSED;
+                sevenseg_show(tetris_timer_seconds(), tetris_score);
                 show_tetris_pause();
                 game_delay(90000u);
                 continue;
