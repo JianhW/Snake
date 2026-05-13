@@ -7,6 +7,11 @@ module VGA_test
     input BUT2,
     input BUT3,
     input BUT4,
+    
+    input sw1,
+    input sw2,
+    input sw3,
+    input sw4,
 
     input sw5,
     input sw6,
@@ -136,16 +141,29 @@ reg [7:0] sel_r;
 reg [15:0] seg_scan;
 reg [21:0] led_step_div;
 reg [7:0] led_pwm_cnt;
+reg [7:0] led_anim_phase;
+reg [9:0] led_sparkle;
 reg [3:0] led_wave_pos;
 reg       led_wave_dir;
 reg [9:0] led_r;
 reg [7:0] led_level;
+reg       led_sparkle_bit;
 integer   led_idx;
 integer   led_dist;
+integer   led_dist_b;
+integer   led_center_dist;
+wire [2:0] led_effect_sel;
 
 assign seg = seg_r;
 assign sel = sel_r;
 assign LED = led_r;
+
+// sw1 has the highest priority if more than one switch is on.
+assign led_effect_sel = sw1 ? 3'd1 :
+                        sw2 ? 3'd2 :
+                        sw3 ? 3'd3 :
+                        sw4 ? 3'd4 :
+                              3'd0;
 
 function [6:0] sevenseg_decode;
     input [3:0] digit;
@@ -227,9 +245,12 @@ begin
 end
 
 /////////////////////////////////////////////////////
-// LED wave
-// Use PWM shoulders around a moving crest to fake a
-// softer "wave" on simple on/off LEDs.
+// LED effects
+// 0: original soft wave when sw1..sw4 are all off
+// 1: crossed comet trails
+// 2: breathing aurora with moving highlight
+// 3: center ripple
+// 4: pseudo-random sparkle
 /////////////////////////////////////////////////////
 
 always @(posedge clk or negedge rst_n)
@@ -245,12 +266,16 @@ begin
     if(!rst_n)
     begin
         led_step_div <= 22'd0;
+        led_anim_phase <= 8'd0;
+        led_sparkle <= 10'b1001010110;
         led_wave_pos <= 4'd0;
         led_wave_dir <= 1'b0;
     end
     else if(led_step_div == 22'd2499999)
     begin
         led_step_div <= 22'd0;
+        led_anim_phase <= led_anim_phase + 8'd1;
+        led_sparkle <= {led_sparkle[8:0], led_sparkle[9] ^ led_sparkle[6]};
 
         if(!led_wave_dir)
         begin
@@ -280,23 +305,147 @@ end
 always @*
 begin
     led_r = 10'd0;
+    led_level = 8'd0;
+    led_sparkle_bit = 1'b0;
+    led_dist = 0;
+    led_dist_b = 0;
+    led_center_dist = 0;
 
-    for(led_idx = 0; led_idx < 10; led_idx = led_idx + 1)
-    begin
-        if(led_wave_pos >= led_idx)
-            led_dist = led_wave_pos - led_idx;
-        else
-            led_dist = led_idx - led_wave_pos;
+    case(led_effect_sel)
+        3'd1:
+        begin
+            // Two opposite comets cross with PWM tails.
+            for(led_idx = 0; led_idx < 10; led_idx = led_idx + 1)
+            begin
+                if(led_wave_pos >= led_idx)
+                    led_dist = led_wave_pos - led_idx;
+                else
+                    led_dist = led_idx - led_wave_pos;
 
-        case(led_dist)
-            0: led_level = 8'hFF;
-            1: led_level = 8'h70;
-            2: led_level = 8'h20;
-            default: led_level = 8'h00;
-        endcase
+                if((4'd9 - led_wave_pos) >= led_idx)
+                    led_dist_b = (4'd9 - led_wave_pos) - led_idx;
+                else
+                    led_dist_b = led_idx - (4'd9 - led_wave_pos);
 
-        led_r[led_idx] = (led_pwm_cnt < led_level);
-    end
+                if(led_dist_b < led_dist)
+                    led_dist = led_dist_b;
+
+                case(led_dist)
+                    0: led_level = 8'hFF;
+                    1: led_level = 8'hB0;
+                    2: led_level = 8'h60;
+                    3: led_level = 8'h20;
+                    default: led_level = 8'h00;
+                endcase
+
+                led_r[led_idx] = (led_pwm_cnt < led_level);
+            end
+        end
+
+        3'd2:
+        begin
+            // Slow global breathing plus a brighter moving ridge.
+            if(led_anim_phase[7])
+                led_level = {~led_anim_phase[6:0], 1'b1};
+            else
+                led_level = {led_anim_phase[6:0], 1'b0};
+
+            for(led_idx = 0; led_idx < 10; led_idx = led_idx + 1)
+            begin
+                if(led_wave_pos >= led_idx)
+                    led_dist = led_wave_pos - led_idx;
+                else
+                    led_dist = led_idx - led_wave_pos;
+
+                if(led_dist == 0)
+                    led_r[led_idx] = (led_pwm_cnt < 8'hFF);
+                else if(led_dist == 1)
+                    led_r[led_idx] = (led_pwm_cnt < (led_level | 8'h60));
+                else
+                    led_r[led_idx] = (led_pwm_cnt < (led_level >> 1));
+            end
+        end
+
+        3'd3:
+        begin
+            // Ripple grows from the center and fades toward the edge.
+            for(led_idx = 0; led_idx < 10; led_idx = led_idx + 1)
+            begin
+                if(led_idx < 5)
+                    led_center_dist = 4 - led_idx;
+                else
+                    led_center_dist = led_idx - 5;
+
+                if((led_wave_pos[2:0] + led_center_dist) > 4)
+                    led_dist = (led_wave_pos[2:0] + led_center_dist) - 4;
+                else
+                    led_dist = 4 - (led_wave_pos[2:0] + led_center_dist);
+
+                case(led_dist)
+                    0: led_level = 8'hFF;
+                    1: led_level = 8'h90;
+                    2: led_level = 8'h35;
+                    default: led_level = 8'h08;
+                endcase
+
+                led_r[led_idx] = (led_pwm_cnt < led_level);
+            end
+        end
+
+        3'd4:
+        begin
+            // Twinkling pseudo-random points with a moving bright sweep.
+            for(led_idx = 0; led_idx < 10; led_idx = led_idx + 1)
+            begin
+                if(led_wave_pos >= led_idx)
+                    led_dist = led_wave_pos - led_idx;
+                else
+                    led_dist = led_idx - led_wave_pos;
+
+                case(led_idx)
+                    0: led_sparkle_bit = led_sparkle[0];
+                    1: led_sparkle_bit = led_sparkle[1];
+                    2: led_sparkle_bit = led_sparkle[2];
+                    3: led_sparkle_bit = led_sparkle[3];
+                    4: led_sparkle_bit = led_sparkle[4];
+                    5: led_sparkle_bit = led_sparkle[5];
+                    6: led_sparkle_bit = led_sparkle[6];
+                    7: led_sparkle_bit = led_sparkle[7];
+                    8: led_sparkle_bit = led_sparkle[8];
+                    default: led_sparkle_bit = led_sparkle[9];
+                endcase
+
+                if(led_dist == 0)
+                    led_level = 8'hFF;
+                else if(led_sparkle_bit)
+                    led_level = led_anim_phase[2] ? 8'hD0 : 8'h50;
+                else
+                    led_level = led_anim_phase[3] ? 8'h18 : 8'h00;
+
+                led_r[led_idx] = (led_pwm_cnt < led_level);
+            end
+        end
+
+        default:
+        begin
+            for(led_idx = 0; led_idx < 10; led_idx = led_idx + 1)
+            begin
+                if(led_wave_pos >= led_idx)
+                    led_dist = led_wave_pos - led_idx;
+                else
+                    led_dist = led_idx - led_wave_pos;
+
+                case(led_dist)
+                    0: led_level = 8'hFF;
+                    1: led_level = 8'h70;
+                    2: led_level = 8'h20;
+                    default: led_level = 8'h00;
+                endcase
+
+                led_r[led_idx] = (led_pwm_cnt < led_level);
+            end
+        end
+    endcase
 end
 
 /////////////////////////////////////////////////////
