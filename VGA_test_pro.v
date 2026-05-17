@@ -1,3 +1,4 @@
+"""文件用来测试FPGA到VGA的链路是否接通"""
 module VGA_test
 (
   input clk,
