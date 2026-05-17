@@ -21,8 +21,8 @@
 ## 系统结构
 
 ```text
-+--------------------+        APB         +---------------------+
-| Sapphire RISC-V SoC | -----------------> | apb_framebuffer     |
++--------------------+         APB         +---------------------+
+| Sapphire RISC-V SoC| ------------------> | apb_framebuffer     |
 |                    |                     | - 64x64 framebuffer |
 | - game logic       |                     | - switch register   |
 | - RGB565 drawing   |                     | - seven-seg regs    |
