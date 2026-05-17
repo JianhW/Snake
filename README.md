@@ -29,11 +29,11 @@
 | - GPIO buttons     |                     +----------+----------+
 | - buzzer control   |                                |
 +----------+---------+                                | pixel_addr/pixel_data
-           | GPIO                                      |
-           v                                           v
+           | GPIO                                     |
+           v                                          v
    buttons / buzzer                         +---------------------+
-                                            | VGA timing/scaler    |
-                                            | 640x480 RGB output   |
+                                            |  VGA timing/scaler  |
+                                            |  640x480 RGB output |
                                             +---------------------+
 ```
 
